@@ -227,19 +227,19 @@ impl Array8 {
     fn rebuild_cached_values(&mut self) {
         self.num_zeros = self.bytes.iter().filter(|&&v| v == 0).count() as u32;
 
-        // Recompute kxq values from actual register values
-        // This is essential after bulk merges where registers change but estimator isn't updated
-        // incrementally
-        let mut kxq0_sum = 0.0;
+        // Match Java's union rebuild arithmetic, including its rounding and split KxQ sums.
+        // Summing only positive powers can change the estimate for high register values.
+        let mut kxq0_sum = self.bytes.len() as f64;
         let mut kxq1_sum = 0.0;
 
         for &val in self.bytes.iter() {
-            if val == 0 {
-                kxq0_sum += 1.0;
-            } else if val < 32 {
-                kxq0_sum += 1.0 / (1u64 << val) as f64;
-            } else {
-                kxq1_sum += 1.0 / (1u64 << val) as f64;
+            if val > 0 {
+                let delta = 1.0 / (1u64 << val) as f64 - 1.0;
+                if val < 32 {
+                    kxq0_sum += delta;
+                } else {
+                    kxq1_sum += delta;
+                }
             }
         }
 
@@ -598,6 +598,19 @@ mod tests {
 
         // Should be 13 zeros (16 total - 3 non-zero)
         assert_eq!(arr.num_zeros, 13);
+    }
+
+    #[test]
+    fn test_bulk_merge_preserves_java_high_register_estimate() {
+        let mut dst = Array8::new(4);
+        // Java's HLL8 rebuild starts KxQ0 at K and subtracts each replaced zero
+        // from the corresponding sum. The rounding is observable at high register values.
+        dst.merge_array_same_lgk(&[50; 16]);
+        assert_eq!(dst.estimator.kxq0(), 16.0);
+        assert_eq!(dst.estimator.kxq1(), -15.999999999999993);
+        assert_eq!(dst.estimate(), 24_251_039_740_365_392.0);
+        dst.merge_array_same_lgk(&[50; 16]);
+        assert_eq!(dst.estimate(), 24_251_039_740_365_392.0);
     }
 
     #[test]

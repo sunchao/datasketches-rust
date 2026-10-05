@@ -558,8 +558,8 @@ fn convert_array8_to_type(src: &Array8, lg_config_k: u8, target_type: HllType) -
     }
 }
 
-/// Copy Array4/Array6 registers into Array8 by converting to coupons
-fn copy_array46_via_coupons(dst: &mut Array8, num_registers: usize, get_value: impl Fn(u32) -> u8) {
+/// Copy or downsample registers into Array8 by converting to coupons
+fn copy_array_via_coupons(dst: &mut Array8, num_registers: usize, get_value: impl Fn(u32) -> u8) {
     for slot in 0..num_registers {
         let val = get_value(slot as u32);
         if val > 0 {
@@ -574,36 +574,95 @@ fn copy_array46_via_coupons(dst: &mut Array8, num_registers: usize, get_value: i
 /// Directly copies if src_lg_k <= tgt_lg_k, downsamples otherwise.
 /// The source estimate state carries over because the result represents the same logical sketch.
 fn copy_or_downsample(src_mode: &Mode, src_lg_k: u8, tgt_lg_k: u8) -> Array8 {
-    let estimate_state = get_array_estimate_state(src_mode);
-
-    let mut result = if src_lg_k <= tgt_lg_k {
-        let mut result = Array8::new(src_lg_k);
-
-        match src_mode {
-            Mode::Array8(src) => {
-                result.merge_array_same_lgk(src.values());
-            }
-            Mode::Array6(src) => {
-                copy_array46_via_coupons(&mut result, src.num_registers(), |slot| src.get(slot));
-            }
-            Mode::Array4(src) => {
-                copy_array46_via_coupons(&mut result, src.num_registers(), |slot| src.get(slot));
-            }
-            Mode::List { .. } | Mode::Set { .. } => {
-                unreachable!(
-                    "copy_or_downsample called with non-array mode; List/Set not supported"
-                );
-            }
+    if src_lg_k <= tgt_lg_k {
+        if let Mode::Array8(src) = src_mode {
+            // A representation-preserving copy must retain Java's serialized KxQ caches.
+            return src.clone();
         }
+    }
 
-        result
-    } else {
-        // Downsample from src to tgt
-        let mut result = Array8::new(tgt_lg_k);
-        merge_array_with_downsample(&mut result, tgt_lg_k, src_mode, src_lg_k);
-        result
-    };
+    let estimate_state = get_array_estimate_state(src_mode);
+    let mut result = Array8::new(src_lg_k.min(tgt_lg_k));
+    // Java conversions and downsampling replay coupons, preserving incremental rounding.
+    // Bulk merges rebuild KxQ with a different floating-point evaluation order.
+    match src_mode {
+        Mode::Array8(src) => {
+            copy_array_via_coupons(&mut result, src.num_registers(), |slot| src.get(slot));
+        }
+        Mode::Array6(src) => {
+            copy_array_via_coupons(&mut result, src.num_registers(), |slot| src.get(slot));
+        }
+        Mode::Array4(src) => {
+            copy_array_via_coupons(&mut result, src.num_registers(), |slot| src.get(slot));
+        }
+        Mode::List { .. } | Mode::Set { .. } => {
+            unreachable!("copy_or_downsample called with non-array mode; List/Set not supported");
+        }
+    }
 
     result.restore_estimate_state(estimate_state);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn high_register_array(lg_k: u8) -> Array8 {
+        let mut array = Array8::new(lg_k);
+        for slot in 0..1 << lg_k {
+            array.update(Coupon::pack(slot, 50));
+        }
+        array
+    }
+
+    #[test]
+    fn test_copy_preserves_java_kxq_after_sparse_inputs() {
+        // Java 3.3.0 and 6.1.1 rebuild an HLL8 union with lgK=4 and all registers
+        // equal to 50 to these caches. Summing positive powers instead halves its estimate.
+        let mut source = high_register_array(4);
+        source.rebuild_estimator_from_registers();
+        let mut bytes = HllSketch::from_mode(4, Mode::Array8(source)).serialize();
+        bytes[16..24].copy_from_slice(&16.0_f64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(-15.999999999999993_f64).to_le_bytes());
+        let source = HllSketch::deserialize(&bytes).unwrap();
+        assert_eq!(source.estimate(), 24_251_039_740_365_392.0);
+
+        for prior_count in [0, 1, 10] {
+            let mut union = HllUnion::new(8).unwrap();
+            for value in 0..prior_count {
+                union.update_value(value);
+            }
+            union.update(&source);
+            assert_eq!(
+                union.estimate(),
+                source.estimate(),
+                "prior_count={prior_count}"
+            );
+            assert_eq!(
+                union.to_sketch(HllType::Hll8).serialize()[16..32],
+                source.serialize()[16..32]
+            );
+        }
+    }
+
+    #[test]
+    fn test_downsampling_replays_registers_without_bulk_rebuild() {
+        // Java downsampling updates coupons incrementally, unlike its bulk-merge rebuild.
+        // For these high registers the two floating-point evaluation orders differ by 2x.
+        let mut source = high_register_array(5);
+        source.rebuild_estimator_from_registers();
+        for source in [
+            Mode::Array8(source.clone()),
+            convert_array8_to_type(&source, 5, HllType::Hll4)
+                .mode()
+                .clone(),
+            convert_array8_to_type(&source, 5, HllType::Hll6)
+                .mode()
+                .clone(),
+        ] {
+            let result = copy_or_downsample(&source, 5, 4);
+            assert_eq!(result.estimate(), 12_125_519_870_182_696.0);
+        }
+    }
 }

@@ -4,6 +4,10 @@ All significant changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Bug fixes
+
+* `HllUnion` preserves Java HLL8 estimator caches when copying a sketch and matches Java's cache rebuilding and downsampling arithmetic, avoiding incorrect estimates for high register values.
+
 ## v0.5.0
 
 ### Breaking changes
